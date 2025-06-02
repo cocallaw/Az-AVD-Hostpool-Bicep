@@ -1,12 +1,18 @@
 param location string = resourceGroup().location
 param tags object = {}
 
-// AVD Resource Parameters
+// Network Parameters
+param vnetName string
+param subnetName string
+param vnetResourceGroup string
+
+// AVD Parameters
 param hostPoolName string
 param friendlyName string = hostPoolName
 param loadBalancerType string = 'BreadthFirst'
 param preferredAppGroupType string = 'Desktop'
-param maxSessionLimit int = 2
+param sessionHostCount int
+param maxSessionLimit int
 @description('Token validity duration in ISO 8601 format')
 param tokenValidityLength string = 'PT8H' // 8 hours by default
 @description('Generated. Do not provide a value! This date value is used to generate a registration token.')
@@ -24,6 +30,27 @@ param agentUpdate object = {
     }
   ]
 }
+
+// Session Host VM Parameters
+@maxLength(10)
+param vmNamePrefix string
+param vmSize string = 'Standard_DS2_v2'
+param adminUsername string
+@secure()
+param adminPassword string
+
+// Multisession image without Office
+var osImage = 'microsoftwindowsdesktop:Windows-11:win11-24h2-avd:latest'
+var vmNames = [for i in range(1, sessionHostCount): '${vmNamePrefix}-${padLeft(i, 2, '0')}']
+// URL to the AVD artifacts location
+var storageAccountName = 'wvdportalstorageblob'
+var containerName = 'galleryartifacts'
+var blobName01 = 'Configuration_1.0.02698.323.zip'
+//var blobName02 = 'Configuration_09-08-2022.zip'
+var AVDartifactsLocation = 'https://${storageAccountName}.blob${environment().suffixes.storage}/${containerName}/${blobName01}'
+var intune = false
+var aadJoin = true
+var aadJoinPreview = false
 
 // Create AVD Host Pool
 resource hostPool 'Microsoft.DesktopVirtualization/hostPools@2024-04-03' = {
@@ -70,7 +97,6 @@ resource workspace 'Microsoft.DesktopVirtualization/workspaces@2024-11-01-previe
   }
 }
 
-
 module hostPoolRegistrationToken 'token.bicep' = {
   name: 'hostPoolRegistrationToken'
   params: {
@@ -85,13 +111,185 @@ module hostPoolRegistrationToken 'token.bicep' = {
     startVMOnConnect: hostPool.properties.startVMOnConnect
     validationEnvironment: hostPool.properties.validationEnvironment
     agentUpdate: hostPool.properties.agentUpdate
-
   }
-    dependsOn: [
+  dependsOn: [
     desktopAppGroup
     workspace
   ]
 }
+
+// Retrieve the existing VNet and Subnet
+resource existingVNet 'Microsoft.Network/virtualNetworks@2021-05-01' existing = {
+  name: vnetName
+  scope: resourceGroup(vnetResourceGroup)
+}
+
+resource existingSubnet 'Microsoft.Network/virtualNetworks/subnets@2021-05-01' existing = {
+  parent: existingVNet
+  name: subnetName
+}
+
+resource nic 'Microsoft.Network/networkInterfaces@2024-05-01' = [
+  for (name, i) in vmNames: {
+    name: '${name}-nic'
+    location: location
+    properties: {
+      ipConfigurations: [
+        {
+          name: 'ipconfig1'
+          properties: {
+            subnet: {
+              id: existingSubnet.id
+            }
+            privateIPAllocationMethod: 'Dynamic'
+          }
+        }
+      ]
+    }
+    dependsOn: [
+      existingVNet
+      existingSubnet
+    ]
+  }
+]
+
+resource vmSessionHost 'Microsoft.Compute/virtualMachines@2024-11-01' = [
+  for (name, i) in vmNames: {
+    name: name
+    location: location
+    identity: {
+      type: 'SystemAssigned'
+    }
+    properties: {
+      hardwareProfile: {
+        vmSize: vmSize
+      }
+      osProfile: {
+        computerName: vmNames[i]
+        adminUsername: adminUsername
+        adminPassword: adminPassword
+      }
+      storageProfile: {
+        imageReference: {
+          publisher: split(osImage, ':')[0]
+          offer: split(osImage, ':')[1]
+          sku: split(osImage, ':')[2]
+          version: split(osImage, ':')[3]
+        }
+        osDisk: {
+          createOption: 'FromImage'
+          managedDisk: {
+            storageAccountType: 'Premium_LRS'
+          }
+        }
+      }
+      networkProfile: {
+        networkInterfaces: [
+          {
+            id: nic[i].id
+          }
+        ]
+      }
+      diagnosticsProfile: {
+        bootDiagnostics: {
+          enabled: true
+          storageUri: ''
+        }
+      }
+    }
+    dependsOn: [
+      nic[i]
+      hostPoolRegistrationToken
+    ]
+  }
+]
+
+// EntraLoginForWindows Extension
+resource entraloginExtension 'Microsoft.Compute/virtualMachines/extensions@2024-11-01' = [
+  for (name, i) in vmNames: {
+    name: '${name}/AADLoginForWindows'
+    location: resourceGroup().location
+    properties: {
+      publisher: 'Microsoft.Azure.ActiveDirectory'
+      type: 'AADLoginForWindows'
+      typeHandlerVersion: '2.0'
+      autoUpgradeMinorVersion: true
+      settings: (intune
+        ? {
+            mdmId: '0000000a-0000-0000-c000-000000000000'
+          }
+        : null)
+    }
+    dependsOn: [
+      vmSessionHost[i]
+      nic[i]
+    ]
+  }
+]
+
+// Custom Script Extension for AVD Linux Broker 
+resource windowsCustomScriptExtension 'Microsoft.Compute/virtualMachines/extensions@2024-11-01' = [
+  for (name, i) in vmNames: {
+    name: '${name}/CustomScriptExtension'
+    location: resourceGroup().location
+    properties: {
+      publisher: 'Microsoft.Compute'
+      type: 'CustomScriptExtension'
+      typeHandlerVersion: '1.10'
+      autoUpgradeMinorVersion: true
+      settings: {
+        fileUris: [
+          'https://raw.githubusercontent.com/microsoft/LinuxBrokerForAVDAccess/refs/heads/main/custom_script_extensions/Configure-AVD-Host.ps1'
+        ]
+      }
+      protectedSettings: {
+        commandToExecute: 'powershell -ExecutionPolicy Unrestricted -File Configure-AVD-Host.ps1'
+      }
+    }
+    dependsOn: [
+      vmSessionHost[i]
+      entraloginExtension[i]
+      hostPoolRegistrationToken
+    ]
+  }
+]
+
+// AVD DSC Configuration
+resource avdDscExtension 'Microsoft.Compute/virtualMachines/extensions@2024-11-01' = [
+  for (name, i) in vmNames: {
+    name: '${name}/Microsoft.PowerShell.DSC'
+    location: resourceGroup().location
+    properties: {
+      publisher: 'Microsoft.Powershell'
+      type: 'DSC'
+      typeHandlerVersion: '2.76'
+      autoUpgradeMinorVersion: true
+      settings: {
+        modulesUrl: AVDartifactsLocation
+        configurationFunction: 'Configuration.ps1\\AddSessionHost'
+        properties: {
+          hostPoolName: hostPool.name
+          registrationInfoTokenCredential: {
+            UserName: 'PLACEHOLDER_DO_NOT_USE'
+            Password: 'PrivateSettingsRef:registrationInfoToken'
+          }
+          aadJoin: aadJoin
+          UseAgentDownloadEndpoint: true
+          aadJoinPreview: aadJoinPreview
+          mdmId: (intune ? '0000000a-0000-0000-c000-000000000000' : '')
+          sessionHostConfigurationLastUpdateTime: ''
+        }
+      }
+      protectedSettings: {
+        registrationInfoToken: hostPoolRegistrationToken.outputs.registrationToken
+      }
+    }
+    dependsOn: [
+      vmSessionHost[i]
+      entraloginExtension[i]
+    ]
+  }
+]
 
 // Optionally, output the registration token for host pool joining
 output hostPoolRegistrationToken string = hostPoolRegistrationToken.outputs.registrationToken

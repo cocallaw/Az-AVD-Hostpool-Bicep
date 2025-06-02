@@ -37,4 +37,5 @@ resource hostPoolTokenUpdate 'Microsoft.DesktopVirtualization/hostPools@2024-04-
   }
 }
 
+@secure()
 output registrationToken string = first(hostPoolTokenUpdate.listRegistrationTokens().value).token
