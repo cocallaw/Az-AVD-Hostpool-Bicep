@@ -15,7 +15,6 @@ param tokenValidityLength string = 'PT8H' // 8 hours by default
 @description('Generated. Do not provide a value! This date value is used to generate a registration token.')
 param baseTime string = utcNow('u')
 
-// Then update the registration token (this will return the token in the response)
 resource hostPoolTokenUpdate 'Microsoft.DesktopVirtualization/hostPools@2024-04-03' = {
   name: hostPoolName
   location: location
@@ -38,4 +37,4 @@ resource hostPoolTokenUpdate 'Microsoft.DesktopVirtualization/hostPools@2024-04-
 }
 
 @secure()
-output registrationToken string = first(hostPoolTokenUpdate.listRegistrationTokens().value).token
+output registrationToken string = first(hostPoolTokenUpdate.listRegistrationTokens().value)!.token
